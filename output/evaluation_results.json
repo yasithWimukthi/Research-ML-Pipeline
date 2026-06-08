@@ -1,0 +1,17 @@
+{
+  "xgboost": {
+    "precision": 0.443,
+    "recall": 0.875,
+    "f1": 0.5882,
+    "roc_auc": 0.8888,
+    "cv_f1_mean": 0.627,
+    "cv_roc_mean": 0.9013
+  },
+  "lstm": {
+    "precision": 0.3665,
+    "recall": 0.875,
+    "f1": 0.5166,
+    "roc_auc": 0.8428,
+    "threshold": 0.6
+  }
+}
