@@ -1,7 +1,7 @@
 {
-  "total_windows": 2250,
-  "normal_windows": 1852,
-  "pre_failure_windows": 398,
+  "total_windows": 2405,
+  "normal_windows": 2032,
+  "pre_failure_windows": 373,
   "feature_count": 214,
   "features": [
     "order-service__error_count",
@@ -221,5 +221,5 @@
   ],
   "window_size_seconds": 30,
   "prediction_horizon_s": 300,
-  "failure_events_found": 219
+  "failure_events_found": 247
 }
