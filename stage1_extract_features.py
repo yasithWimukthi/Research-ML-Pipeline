@@ -1,13 +1,29 @@
 """
-stage1_extract_features.py  (v2 — with rolling features)
+stage1_extract_features.py  (v4 — fixes failure-anchor timing bug)
 ─────────────────────────────────────────────────────────────
 Queries Elasticsearch, groups logs into 30-second time windows,
 extracts ML features, adds rolling trend features, labels windows.
 
-Changes from v1:
-  - Removes noisy info_count / log_count features
-  - Adds rolling mean + delta features for trend detection
-  - These two changes significantly improve Precision
+v4 FIX (critical):
+  For GRADUAL failures (memory leak, DB pool exhaustion), the
+  5-minute "pre-failure" label was anchored to the STARTED event —
+  but STARTED just marks when the injection script began, not when
+  the system actually became critical. For a memory leak, heap is
+  still ~0% right at STARTED and only becomes dangerous several
+  minutes later. This meant the model was trained on "pre-failure"
+  windows where heap was still normal, while the genuinely high-heap
+  period (which happens AFTER STARTED) was labelled "normal" (0) —
+  exactly backwards from what we want to predict.
+
+  Fix: for MEMORY_LEAK and DB_POOL_EXHAUSTION specifically, anchor
+  the 5-minute window to the first `status=CRITICAL` log instead of
+  `status=STARTED`. Both injection types already emit this marker
+  (heap > 70% for memory leak; pool exhausted for DB). All other
+  injection types (CPU overload, slow query, gateway timeout, high
+  latency) have immediate effect upon STARTED, so they keep using
+  STARTED as before — no change needed for those.
+
+  v3 fix (global_error_rate denominator bug) is also included here.
 
 Usage:
   python stage1_extract_features.py
@@ -26,6 +42,12 @@ from tqdm import tqdm
 import config
 
 warnings.filterwarnings("ignore")
+
+# Failure types that take time to BUILD toward a critical state.
+# For these, STARTED ≠ the actual failure onset — we anchor to
+# the explicit CRITICAL marker instead. All other types have
+# immediate effect, so STARTED remains a valid anchor for them.
+GRADUAL_FAILURE_TYPES = {"MEMORY_LEAK", "DB_POOL_EXHAUSTION"}
 
 
 def connect_es():
@@ -71,25 +93,88 @@ def fetch_all_logs(es: Elasticsearch) -> pd.DataFrame:
 
 
 def find_failure_events(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Builds the list of failure 'anchor' timestamps used for labelling.
+
+    For SUDDEN failure types: anchor = STARTED event (unchanged).
+    For GRADUAL failure types (memory leak, DB pool exhaustion):
+      anchor = first CRITICAL event AFTER the matching STARTED event,
+      for the same service + injection type. If a session never
+      reached CRITICAL (e.g. recovered early), it's skipped — there's
+      no legitimate "approaching failure" signal to label in that case.
+    """
     print("\nFinding failure injection events...")
-    mask = (
+
+    started_mask = (
         df["message"].str.contains("FAILURE_INJECTION", na=False) &
         df["message"].str.contains("status=STARTED",    na=False)
     )
-    failure_df = df[mask].copy()
+    started_df = df[started_mask].copy()
 
-    if failure_df.empty:
-        print("  ⚠ No failure injection events found.")
-        return pd.DataFrame(columns=["timestamp", "injection_type", "service"])
+    if started_df.empty:
+        print("  ⚠ No failure injection STARTED events found.")
+        return pd.DataFrame(columns=["timestamp", "injection_type", "service", "anchor_type"])
 
-    failure_df["injection_type"] = failure_df["message"].str.extract(r"type=(\w+)")
-    result = failure_df[["@timestamp", "injection_type", "service"]].rename(
+    started_df["injection_type"] = started_df["message"].str.extract(r"type=(\w+)")
+    started_df = started_df[["@timestamp", "injection_type", "service"]].rename(
         columns={"@timestamp": "timestamp"}
     )
-    print(f"  ✓ Found {len(result)} failure injection events:")
+
+    # Find all CRITICAL events (only relevant for gradual types)
+    critical_mask = (
+        df["message"].str.contains("FAILURE_INJECTION", na=False) &
+        df["message"].str.contains("status=CRITICAL",   na=False)
+    )
+    critical_df = df[critical_mask].copy()
+    if not critical_df.empty:
+        critical_df["injection_type"] = critical_df["message"].str.extract(r"type=(\w+)")
+        critical_df = critical_df[["@timestamp", "injection_type", "service"]].rename(
+            columns={"@timestamp": "timestamp"}
+        )
+
+    anchors = []
+    skipped_no_critical = 0
+
+    for _, row in started_df.iterrows():
+        inj_type = row["injection_type"]
+        service  = row["service"]
+        start_ts = row["timestamp"]
+
+        if inj_type in GRADUAL_FAILURE_TYPES and not critical_df.empty:
+            candidates = critical_df[
+                (critical_df["service"]        == service) &
+                (critical_df["injection_type"] == inj_type) &
+                (critical_df["timestamp"]      > start_ts)
+            ].sort_values("timestamp")
+
+            if not candidates.empty:
+                anchor_ts = candidates.iloc[0]["timestamp"]
+                anchors.append({
+                    "timestamp":      anchor_ts,
+                    "injection_type": inj_type,
+                    "service":        service,
+                    "anchor_type":    "CRITICAL",
+                })
+            else:
+                skipped_no_critical += 1
+        else:
+            anchors.append({
+                "timestamp":      start_ts,
+                "injection_type": inj_type,
+                "service":        service,
+                "anchor_type":    "STARTED",
+            })
+
+    result = pd.DataFrame(anchors)
+
+    print(f"  ✓ Found {len(started_df)} STARTED events total")
+    if skipped_no_critical > 0:
+        print(f"  ⚠ Skipped {skipped_no_critical} gradual-failure sessions that never reached CRITICAL")
+    print(f"  ✓ Using {len(result)} failure anchors for labelling:")
     for _, row in result.iterrows():
         print(f"    [{row['timestamp'].strftime('%H:%M:%S')}] "
-              f"{row['injection_type']} on {row['service']}")
+              f"{row['injection_type']:<20} on {row['service']:<20} (anchor={row['anchor_type']})")
+
     return result
 
 
@@ -127,6 +212,7 @@ def extract_window_features(window_df: pd.DataFrame, service: str) -> dict:
             f"{service}__avg_cpu_pct":     0.0,
             f"{service}__max_cpu_pct":     0.0,
             f"{service}__injection_active": 0,
+            f"{service}__total_logs":      0,
         }
 
     levels      = svc_df["level"].str.upper() if "level" in svc_df.columns else pd.Series(dtype=str)
@@ -157,14 +243,14 @@ def extract_window_features(window_df: pd.DataFrame, service: str) -> dict:
         f"{service}__avg_cpu_pct":     round(float(cpu_vals.mean()),  2) if len(cpu_vals)  else 0.0,
         f"{service}__max_cpu_pct":     round(float(cpu_vals.max()),   2) if len(cpu_vals)  else 0.0,
         f"{service}__injection_active": injection_active,
+        f"{service}__total_logs":      total_logs,
     }
 
 
 def add_cross_service_features(row: dict, services: list) -> dict:
     total_errors = sum(row.get(f"{s}__error_count", 0) for s in services)
     total_warns  = sum(row.get(f"{s}__warn_count",  0) for s in services)
-    total_logs   = sum(row.get(f"{s}__error_count", 0) +
-                       row.get(f"{s}__warn_count",  0) for s in services)
+    total_logs   = sum(row.get(f"{s}__total_logs",  0) for s in services)
 
     all_resp = [row.get(f"{s}__avg_response_ms", 0) for s in services if row.get(f"{s}__avg_response_ms", 0) > 0]
     all_heap = [row.get(f"{s}__avg_heap_pct",    0) for s in services if row.get(f"{s}__avg_heap_pct",    0) > 0]
@@ -194,28 +280,9 @@ def label_window(window_start, window_end, failure_events: pd.DataFrame) -> int:
     return 0
 
 
-# ──────────────────────────────────────────────────────────
-#  NEW: Rolling trend features
-# ──────────────────────────────────────────────────────────
 def add_rolling_features(dataset: pd.DataFrame) -> pd.DataFrame:
-    """
-    Add rolling window statistics across consecutive time windows.
-
-    For each key metric, compute:
-      - 3-window rolling mean  → short-term trend (last 1.5 mins)
-      - 5-window rolling mean  → medium-term trend (last 2.5 mins)
-      - delta (diff)           → rate of change — is it getting worse?
-
-    Why this helps:
-      A single window showing heap_pct=65% looks normal.
-      But 5 windows showing [40, 48, 55, 61, 65] is a memory leak.
-      The rolling mean captures this rising trend explicitly,
-      giving the model a clear signal that something is building up.
-    """
     print("\n  Adding rolling trend features...")
 
-    # Only compute rolling stats on these meaningful metric columns
-    # Avoids creating rolling features for counts which are noisy
     key_patterns = [
         "error_rate", "warn_rate",
         "heap_pct", "cpu_pct",
@@ -232,15 +299,12 @@ def add_rolling_features(dataset: pd.DataFrame) -> pd.DataFrame:
 
     new_cols_added = 0
     for col in numeric_cols:
-        # Short-term rolling mean (3 windows = 90 seconds)
         dataset[f"{col}__roll3"] = (
             dataset[col].rolling(window=3, min_periods=1).mean().round(4)
         )
-        # Medium-term rolling mean (5 windows = 150 seconds)
         dataset[f"{col}__roll5"] = (
             dataset[col].rolling(window=5, min_periods=1).mean().round(4)
         )
-        # Rate of change — positive means getting worse
         dataset[f"{col}__delta"] = (
             dataset[col].diff().fillna(0).round(4)
         )
@@ -250,15 +314,12 @@ def add_rolling_features(dataset: pd.DataFrame) -> pd.DataFrame:
     return dataset
 
 
-# ──────────────────────────────────────────────────────────
-#  Main
-# ──────────────────────────────────────────────────────────
 def main():
     os.makedirs("output", exist_ok=True)
     os.makedirs(config.PLOTS_PATH, exist_ok=True)
 
     print("═" * 60)
-    print("  Stage 1: Feature Extraction  (v2 — with rolling features)")
+    print("  Stage 1: Feature Extraction  (v4 — failure anchor fix)")
     print("  MSc Research — Failure Prediction ML Pipeline")
     print("═" * 60)
 
@@ -284,7 +345,7 @@ def main():
         for service in config.SERVICES:
             row.update(extract_window_features(window_df, service))
 
-        row   = add_cross_service_features(row, config.SERVICES)
+        row = add_cross_service_features(row, config.SERVICES)
         row["label"] = label_window(win_start, win_end, failures)
         rows.append(row)
 
@@ -298,24 +359,34 @@ def main():
     if (dataset['label'] == 1).sum() == 0:
         print("\n  ⚠ WARNING: No pre-failure windows found!")
 
-    # ── Remove noisy features ──────────────────────────────
-    # info_count and log_count spike with traffic volume, not failures
-    # Keeping them causes false positives
     noisy_cols = [c for c in dataset.columns if
-                  c.endswith('__info_count') or c.endswith('__log_count')]
+                  c.endswith('__info_count') or
+                  c.endswith('__log_count')  or
+                  c.endswith('__total_logs')]
     dataset = dataset.drop(columns=noisy_cols)
-    print(f"\n  Dropped {len(noisy_cols)} noisy features (info_count, log_count)")
+    print(f"\n  Dropped {len(noisy_cols)} noisy/internal features: {noisy_cols}")
 
-    # ── Add rolling trend features ─────────────────────────
+    if "global__system_error_rate" in dataset.columns:
+        rate_stats = dataset["global__system_error_rate"].describe()
+        print(f"\n  global__system_error_rate sanity check:")
+        print(f"    mean={rate_stats['mean']:.4f}  max={rate_stats['max']:.4f}  "
+              f"% of windows ==1.0: {(dataset['global__system_error_rate'] == 1.0).mean():.1%}")
+
+    if "order-service__avg_heap_pct" in dataset.columns:
+        heap_in_failure = dataset.loc[dataset["label"] == 1, "order-service__avg_heap_pct"]
+        heap_in_normal  = dataset.loc[dataset["label"] == 0, "order-service__avg_heap_pct"]
+        print(f"\n  order-service__avg_heap_pct sanity check:")
+        print(f"    Pre-failure (1) windows — mean heap%: {heap_in_failure.mean():.2f}")
+        print(f"    Normal (0) windows      — mean heap%: {heap_in_normal.mean():.2f}")
+        print(f"    (Pre-failure mean should now be noticeably HIGHER than normal)")
+
     dataset = add_rolling_features(dataset)
 
     print(f"\n  ✓ Final dataset: {len(dataset):,} windows × {len(dataset.columns)} columns")
 
-    # Save dataset
     dataset.to_csv(config.DATASET_PATH, index=False)
     print(f"  ✓ Dataset saved → {config.DATASET_PATH}")
 
-    # Save feature info
     feature_cols = [c for c in dataset.columns if c not in ["window_start", "window_end", "label"]]
     feature_info = {
         "total_windows":        len(dataset),
