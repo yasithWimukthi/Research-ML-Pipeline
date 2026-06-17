@@ -1,27 +1,37 @@
 """
-stage1_extract_features.py  (v4 — fixes failure-anchor timing bug)
+stage1_extract_features.py  (v5 — dual labelling scheme: predictive vs detection)
 ─────────────────────────────────────────────────────────────
 Queries Elasticsearch, groups logs into 30-second time windows,
 extracts ML features, adds rolling trend features, labels windows.
 
-v4 FIX (critical):
-  For GRADUAL failures (memory leak, DB pool exhaustion), the
-  5-minute "pre-failure" label was anchored to the STARTED event —
-  but STARTED just marks when the injection script began, not when
-  the system actually became critical. For a memory leak, heap is
-  still ~0% right at STARTED and only becomes dangerous several
-  minutes later. This meant the model was trained on "pre-failure"
-  windows where heap was still normal, while the genuinely high-heap
-  period (which happens AFTER STARTED) was labelled "normal" (0) —
-  exactly backwards from what we want to predict.
+v5 CHANGE (methodology refinement):
+  Failure types are now split into two categories with DIFFERENT
+  labelling logic, because they have fundamentally different
+  failure dynamics:
 
-  Fix: for MEMORY_LEAK and DB_POOL_EXHAUSTION specifically, anchor
-  the 5-minute window to the first `status=CRITICAL` log instead of
-  `status=STARTED`. Both injection types already emit this marker
-  (heap > 70% for memory leak; pool exhausted for DB). All other
-  injection types (CPU overload, slow query, gateway timeout, high
-  latency) have immediate effect upon STARTED, so they keep using
-  STARTED as before — no change needed for those.
+  GRADUAL types (currently: MEMORY_LEAK) — these have a genuine,
+    multi-minute build-up before becoming critical (e.g. heap
+    climbing toward exhaustion). For these, label=1 marks the
+    5 minutes BEFORE the first `status=CRITICAL` log — a true
+    "predict before it happens" task. Confirmed working via live
+    testing (alert fired ~20pp before the system's own CRITICAL
+    threshold).
+
+  SUDDEN types (CPU_OVERLOAD, SLOW_QUERY, GATEWAY_TIMEOUT,
+    HIGH_LATENCY, DB_POOL_EXHAUSTION) — these become critical
+    within seconds of STARTED (e.g. DB pool exhausts in ~5s,
+    first timeout fires ~35-40s later). There is no physical
+    precursor signal in the preceding 5 minutes — the system is
+    genuinely healthy until the injection script fires. Trying to
+    label "5 min before STARTED" as pre-failure for these just
+    captures ordinary pre-injection traffic, not real symptoms.
+
+    Instead, for SUDDEN types, label=1 marks the ENTIRE active
+    period from STARTED to the matching RECOVERED event (per
+    service). This reframes the task for these types as RAPID
+    DETECTION (recognise "currently failing" quickly) rather than
+    advance prediction — an honest, achievable goal given these
+    failures have no natural lead time.
 
   v3 fix (global_error_rate denominator bug) is also included here.
 
@@ -43,11 +53,19 @@ import config
 
 warnings.filterwarnings("ignore")
 
-# Failure types that take time to BUILD toward a critical state.
-# For these, STARTED ≠ the actual failure onset — we anchor to
-# the explicit CRITICAL marker instead. All other types have
-# immediate effect, so STARTED remains a valid anchor for them.
-GRADUAL_FAILURE_TYPES = {"MEMORY_LEAK", "DB_POOL_EXHAUSTION"}
+# GRADUAL: genuine multi-minute build-up before crisis — predictive task.
+GRADUAL_FAILURE_TYPES = {"MEMORY_LEAK"}
+
+# SUDDEN: instant/near-instant onset — detection task, not prediction.
+SUDDEN_FAILURE_TYPES = {
+    "CPU_OVERLOAD", "SLOW_QUERY", "GATEWAY_TIMEOUT",
+    "HIGH_LATENCY", "DB_POOL_EXHAUSTION",
+}
+
+# Safety cap if a SUDDEN session's RECOVERED event can't be found
+# (e.g. logs end mid-session) — avoids mislabelling a huge stretch
+# of unrelated future data as "failure".
+MAX_SUDDEN_DURATION_MINUTES = 15
 
 
 def connect_es():
@@ -92,16 +110,16 @@ def fetch_all_logs(es: Elasticsearch) -> pd.DataFrame:
     return df
 
 
-def find_failure_events(df: pd.DataFrame) -> pd.DataFrame:
+def find_failure_events(df: pd.DataFrame):
     """
-    Builds the list of failure 'anchor' timestamps used for labelling.
-
-    For SUDDEN failure types: anchor = STARTED event (unchanged).
-    For GRADUAL failure types (memory leak, DB pool exhaustion):
-      anchor = first CRITICAL event AFTER the matching STARTED event,
-      for the same service + injection type. If a session never
-      reached CRITICAL (e.g. recovered early), it's skipped — there's
-      no legitimate "approaching failure" signal to label in that case.
+    Returns two DataFrames:
+      predictive_anchors — for GRADUAL types: a single timestamp per
+        session (first CRITICAL log). label_window() marks the 5
+        minutes BEFORE this as label=1.
+      active_periods — for SUDDEN types: a (start, end) interval per
+        session, spanning STARTED to the matching RECOVERED event
+        (per service). label_window() marks ANY window inside this
+        interval as label=1.
     """
     print("\nFinding failure injection events...")
 
@@ -113,14 +131,15 @@ def find_failure_events(df: pd.DataFrame) -> pd.DataFrame:
 
     if started_df.empty:
         print("  ⚠ No failure injection STARTED events found.")
-        return pd.DataFrame(columns=["timestamp", "injection_type", "service", "anchor_type"])
+        return (pd.DataFrame(columns=["timestamp", "injection_type", "service"]),
+                pd.DataFrame(columns=["start", "end", "injection_type", "service"]))
 
     started_df["injection_type"] = started_df["message"].str.extract(r"type=(\w+)")
     started_df = started_df[["@timestamp", "injection_type", "service"]].rename(
         columns={"@timestamp": "timestamp"}
-    )
+    ).sort_values("timestamp")
 
-    # Find all CRITICAL events (only relevant for gradual types)
+    # CRITICAL events — only used for GRADUAL types
     critical_mask = (
         df["message"].str.contains("FAILURE_INJECTION", na=False) &
         df["message"].str.contains("status=CRITICAL",   na=False)
@@ -132,50 +151,85 @@ def find_failure_events(df: pd.DataFrame) -> pd.DataFrame:
             columns={"@timestamp": "timestamp"}
         )
 
-    anchors = []
-    skipped_no_critical = 0
+    # RECOVERED events — used to close out SUDDEN type active periods
+    recovered_mask = (
+        df["message"].str.contains("FAILURE_INJECTION", na=False) &
+        df["message"].str.contains("status=RECOVERED",  na=False)
+    )
+    recovered_df = df[recovered_mask].copy()
+    if not recovered_df.empty:
+        recovered_df = recovered_df[["@timestamp", "service"]].rename(
+            columns={"@timestamp": "timestamp"}
+        ).sort_values("timestamp")
+
+    predictive_anchors = []
+    active_periods      = []
+    skipped_no_critical  = 0
+    capped_no_recovery   = 0
 
     for _, row in started_df.iterrows():
         inj_type = row["injection_type"]
         service  = row["service"]
         start_ts = row["timestamp"]
 
-        if inj_type in GRADUAL_FAILURE_TYPES and not critical_df.empty:
-            candidates = critical_df[
-                (critical_df["service"]        == service) &
-                (critical_df["injection_type"] == inj_type) &
-                (critical_df["timestamp"]      > start_ts)
-            ].sort_values("timestamp")
+        if inj_type in GRADUAL_FAILURE_TYPES:
+            if not critical_df.empty:
+                candidates = critical_df[
+                    (critical_df["service"]        == service) &
+                    (critical_df["injection_type"] == inj_type) &
+                    (critical_df["timestamp"]      > start_ts)
+                ].sort_values("timestamp")
+                if not candidates.empty:
+                    predictive_anchors.append({
+                        "timestamp":      candidates.iloc[0]["timestamp"],
+                        "injection_type": inj_type,
+                        "service":        service,
+                    })
+                else:
+                    skipped_no_critical += 1
 
-            if not candidates.empty:
-                anchor_ts = candidates.iloc[0]["timestamp"]
-                anchors.append({
-                    "timestamp":      anchor_ts,
-                    "injection_type": inj_type,
-                    "service":        service,
-                    "anchor_type":    "CRITICAL",
-                })
-            else:
-                skipped_no_critical += 1
-        else:
-            anchors.append({
-                "timestamp":      start_ts,
+        elif inj_type in SUDDEN_FAILURE_TYPES:
+            end_ts = None
+            if not recovered_df.empty:
+                candidates = recovered_df[
+                    (recovered_df["service"]   == service) &
+                    (recovered_df["timestamp"] > start_ts)
+                ].sort_values("timestamp")
+                if not candidates.empty:
+                    end_ts = candidates.iloc[0]["timestamp"]
+
+            if end_ts is None:
+                end_ts = start_ts + pd.Timedelta(minutes=MAX_SUDDEN_DURATION_MINUTES)
+                capped_no_recovery += 1
+
+            active_periods.append({
+                "start":          start_ts,
+                "end":            end_ts,
                 "injection_type": inj_type,
                 "service":        service,
-                "anchor_type":    "STARTED",
             })
 
-    result = pd.DataFrame(anchors)
+    predictive_df = pd.DataFrame(predictive_anchors)
+    active_df     = pd.DataFrame(active_periods)
 
     print(f"  ✓ Found {len(started_df)} STARTED events total")
     if skipped_no_critical > 0:
-        print(f"  ⚠ Skipped {skipped_no_critical} gradual-failure sessions that never reached CRITICAL")
-    print(f"  ✓ Using {len(result)} failure anchors for labelling:")
-    for _, row in result.iterrows():
-        print(f"    [{row['timestamp'].strftime('%H:%M:%S')}] "
-              f"{row['injection_type']:<20} on {row['service']:<20} (anchor={row['anchor_type']})")
+        print(f"  ⚠ Skipped {skipped_no_critical} gradual sessions that never reached CRITICAL")
+    if capped_no_recovery > 0:
+        print(f"  ⚠ Capped {capped_no_recovery} sudden sessions with no RECOVERED event found "
+              f"(used {MAX_SUDDEN_DURATION_MINUTES}-min safety cap)")
 
-    return result
+    print(f"\n  ✓ {len(predictive_df)} PREDICTIVE anchors (gradual types — 5 min before CRITICAL):")
+    for _, row in predictive_df.iterrows():
+        print(f"    [{row['timestamp'].strftime('%H:%M:%S')}] {row['injection_type']:<15} on {row['service']}")
+
+    print(f"\n  ✓ {len(active_df)} ACTIVE periods (sudden types — entire STARTED→RECOVERED span):")
+    for _, row in active_df.iterrows():
+        duration_s = (row["end"] - row["start"]).total_seconds()
+        print(f"    [{row['start'].strftime('%H:%M:%S')} → {row['end'].strftime('%H:%M:%S')}] "
+              f"{row['injection_type']:<15} on {row['service']:<20} ({duration_s:.0f}s)")
+
+    return predictive_df, active_df
 
 
 def build_windows(df: pd.DataFrame) -> list:
@@ -269,14 +323,22 @@ def add_cross_service_features(row: dict, services: list) -> dict:
     return row
 
 
-def label_window(window_start, window_end, failure_events: pd.DataFrame) -> int:
-    if failure_events.empty:
-        return 0
+def label_window(window_start, window_end, predictive_anchors: pd.DataFrame, active_periods: pd.DataFrame) -> int:
     horizon = pd.Timedelta(seconds=config.PREDICTION_HORIZON_SECONDS)
-    for _, failure in failure_events.iterrows():
-        failure_time = failure["timestamp"]
-        if (failure_time - horizon) <= window_start < failure_time:
-            return 1
+
+    # GRADUAL types: 5-minute predictive window before CRITICAL
+    if not predictive_anchors.empty:
+        for _, anchor in predictive_anchors.iterrows():
+            failure_time = anchor["timestamp"]
+            if (failure_time - horizon) <= window_start < failure_time:
+                return 1
+
+    # SUDDEN types: entire active STARTED→RECOVERED period
+    if not active_periods.empty:
+        for _, period in active_periods.iterrows():
+            if period["start"] <= window_start < period["end"]:
+                return 1
+
     return 0
 
 
@@ -319,13 +381,13 @@ def main():
     os.makedirs(config.PLOTS_PATH, exist_ok=True)
 
     print("═" * 60)
-    print("  Stage 1: Feature Extraction  (v4 — failure anchor fix)")
+    print("  Stage 1: Feature Extraction  (v5 — dual labelling scheme)")
     print("  MSc Research — Failure Prediction ML Pipeline")
     print("═" * 60)
 
     es       = connect_es()
     df       = fetch_all_logs(es)
-    failures = find_failure_events(df)
+    predictive_anchors, active_periods = find_failure_events(df)
     windows  = build_windows(df)
 
     print("\nExtracting features from each time window...")
@@ -346,7 +408,7 @@ def main():
             row.update(extract_window_features(window_df, service))
 
         row = add_cross_service_features(row, config.SERVICES)
-        row["label"] = label_window(win_start, win_end, failures)
+        row["label"] = label_window(win_start, win_end, predictive_anchors, active_periods)
         rows.append(row)
 
     dataset = pd.DataFrame(rows)
@@ -354,10 +416,10 @@ def main():
     print(f"\n  ✓ Base dataset: {len(dataset):,} windows × {len(dataset.columns)} columns")
     print(f"  Label distribution:")
     print(f"    Normal (0)      : {(dataset['label'] == 0).sum():,} windows")
-    print(f"    Pre-failure (1) : {(dataset['label'] == 1).sum():,} windows")
+    print(f"    Failure (1)     : {(dataset['label'] == 1).sum():,} windows")
 
     if (dataset['label'] == 1).sum() == 0:
-        print("\n  ⚠ WARNING: No pre-failure windows found!")
+        print("\n  ⚠ WARNING: No failure windows found!")
 
     noisy_cols = [c for c in dataset.columns if
                   c.endswith('__info_count') or
@@ -376,9 +438,23 @@ def main():
         heap_in_failure = dataset.loc[dataset["label"] == 1, "order-service__avg_heap_pct"]
         heap_in_normal  = dataset.loc[dataset["label"] == 0, "order-service__avg_heap_pct"]
         print(f"\n  order-service__avg_heap_pct sanity check:")
-        print(f"    Pre-failure (1) windows — mean heap%: {heap_in_failure.mean():.2f}")
-        print(f"    Normal (0) windows      — mean heap%: {heap_in_normal.mean():.2f}")
-        print(f"    (Pre-failure mean should now be noticeably HIGHER than normal)")
+        print(f"    Failure (1) windows — mean heap%: {heap_in_failure.mean():.2f}")
+        print(f"    Normal (0) windows  — mean heap%: {heap_in_normal.mean():.2f}")
+
+    if "global__avg_response_ms" in dataset.columns:
+        resp_in_failure = dataset.loc[dataset["label"] == 1, "global__avg_response_ms"]
+        resp_in_normal  = dataset.loc[dataset["label"] == 0, "global__avg_response_ms"]
+        print(f"\n  global__avg_response_ms sanity check (validates SUDDEN-type fix):")
+        print(f"    Failure (1) windows — mean response ms: {resp_in_failure.mean():.2f}")
+        print(f"    Normal (0) windows  — mean response ms: {resp_in_normal.mean():.2f}")
+        print(f"    (Failure mean should now be MUCH higher than normal)")
+
+    if "global__system_error_rate" in dataset.columns:
+        err_in_failure = dataset.loc[dataset["label"] == 1, "global__system_error_rate"]
+        err_in_normal  = dataset.loc[dataset["label"] == 0, "global__system_error_rate"]
+        print(f"\n  global__system_error_rate by label (validates SUDDEN-type fix):")
+        print(f"    Failure (1) windows — mean error rate: {err_in_failure.mean():.4f}")
+        print(f"    Normal (0) windows  — mean error rate: {err_in_normal.mean():.4f}")
 
     dataset = add_rolling_features(dataset)
 
@@ -389,14 +465,17 @@ def main():
 
     feature_cols = [c for c in dataset.columns if c not in ["window_start", "window_end", "label"]]
     feature_info = {
-        "total_windows":        len(dataset),
-        "normal_windows":       int((dataset["label"] == 0).sum()),
-        "pre_failure_windows":  int((dataset["label"] == 1).sum()),
-        "feature_count":        len(feature_cols),
-        "features":             feature_cols,
-        "window_size_seconds":  config.WINDOW_SIZE_SECONDS,
-        "prediction_horizon_s": config.PREDICTION_HORIZON_SECONDS,
-        "failure_events_found": len(failures),
+        "total_windows":         len(dataset),
+        "normal_windows":        int((dataset["label"] == 0).sum()),
+        "failure_windows":       int((dataset["label"] == 1).sum()),
+        "feature_count":         len(feature_cols),
+        "features":              feature_cols,
+        "window_size_seconds":   config.WINDOW_SIZE_SECONDS,
+        "prediction_horizon_s":  config.PREDICTION_HORIZON_SECONDS,
+        "gradual_types":         list(GRADUAL_FAILURE_TYPES),
+        "sudden_types":          list(SUDDEN_FAILURE_TYPES),
+        "predictive_anchors":    len(predictive_anchors),
+        "active_periods":        len(active_periods),
     }
     with open(config.FEATURE_INFO_PATH, "w") as f:
         json.dump(feature_info, f, indent=2)
