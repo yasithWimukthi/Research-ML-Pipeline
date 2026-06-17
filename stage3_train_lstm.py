@@ -1,5 +1,11 @@
 """
-stage3_train_lstm.py  (v2 — improved)
+stage3_train_lstm.py  (v3 — chronological train/test split)
+─────────────────────────────────────────────────────────────
+v3 FIX: reverted to a CHRONOLOGICAL split (train on earlier
+timeline, test on later, unseen timeline) instead of the random
+stratified split used previously. Random splitting let sequences
+built from the same failure session leak between train and test,
+inflating apparent performance.
 """
 
 import json
@@ -13,7 +19,6 @@ import pandas as pd
 from sklearn.metrics import (classification_report, confusion_matrix,
                              f1_score, precision_score, recall_score,
                              roc_auc_score, roc_curve)
-from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils.class_weight import compute_class_weight
 import tensorflow as tf
@@ -29,13 +34,9 @@ import config
 warnings.filterwarnings("ignore")
 plt.style.use("seaborn-v0_8-darkgrid")
 
-# Shorter sequence = more training samples from same dataset
-SEQUENCE_LENGTH = 5   # 5 windows × 30s = 2.5 minutes of history
+SEQUENCE_LENGTH = 5
 
 
-# ──────────────────────────────────────────────────────────
-#  Load data
-# ──────────────────────────────────────────────────────────
 def load_data():
     print("Loading dataset...")
     if not os.path.exists(config.DATASET_PATH):
@@ -49,15 +50,12 @@ def load_data():
     X = df[feature_cols].values
     y = df["label"].values
 
-    print(f"  ✓ Loaded {len(df):,} windows × {len(feature_cols)} features")
-    print(f"  Normal (0)      : {(y == 0).sum():,}")
-    print(f"  Pre-failure (1) : {(y == 1).sum():,}")
+    print(f"  ✓ Loaded {len(df):,} windows × {len(feature_cols)} features (sorted chronologically)")
+    print(f"  Normal (0)  : {(y == 0).sum():,}")
+    print(f"  Failure (1) : {(y == 1).sum():,}")
     return X, y, feature_cols
 
 
-# ──────────────────────────────────────────────────────────
-#  Build sequences
-# ──────────────────────────────────────────────────────────
 def build_sequences(X, y, seq_len):
     X_seq, y_seq = [], []
     for i in range(seq_len, len(X)):
@@ -65,20 +63,13 @@ def build_sequences(X, y, seq_len):
         y_seq.append(y[i])
     X_seq = np.array(X_seq)
     y_seq = np.array(y_seq)
-    print(f"\n  Sequences built  : {X_seq.shape}")
-    print(f"  Normal (0)       : {(y_seq == 0).sum():,}")
-    print(f"  Pre-failure (1)  : {(y_seq == 1).sum():,}")
+    print(f"\n  Sequences built : {X_seq.shape}")
+    print(f"  Normal (0)      : {(y_seq == 0).sum():,}")
+    print(f"  Failure (1)     : {(y_seq == 1).sum():,}")
     return X_seq, y_seq
 
 
-# ──────────────────────────────────────────────────────────
-#  Build model — Bidirectional LSTM
-# ──────────────────────────────────────────────────────────
 def build_model(seq_len, n_features):
-    """
-    Bidirectional LSTM — reads sequence forwards AND backwards.
-    Better at detecting patterns in short sequences than standard LSTM.
-    """
     model = Sequential([
         Input(shape=(seq_len, n_features)),
         Bidirectional(LSTM(32, return_sequences=True), name="bilstm_1"),
@@ -102,13 +93,9 @@ def build_model(seq_len, n_features):
     return model
 
 
-# ──────────────────────────────────────────────────────────
-#  Evaluate
-# ──────────────────────────────────────────────────────────
 def evaluate(model, X_test, y_test):
     y_prob = model.predict(X_test, verbose=0).flatten()
 
-    # Find best threshold
     best_t, best_f1 = 0.5, 0.0
     for t in np.arange(0.2, 0.65, 0.05):
         preds = (y_prob >= t).astype(int)
@@ -117,7 +104,7 @@ def evaluate(model, X_test, y_test):
             best_f1, best_t = score, t
     print(f"\n  Best threshold : {best_t:.2f}  (F1={best_f1:.4f})")
 
-    y_pred  = (y_prob >= best_t).astype(int)
+    y_pred    = (y_prob >= best_t).astype(int)
     precision = precision_score(y_test, y_pred, zero_division=0)
     recall    = recall_score(y_test, y_pred,    zero_division=0)
     f1        = f1_score(y_test, y_pred,        zero_division=0)
@@ -130,9 +117,8 @@ def evaluate(model, X_test, y_test):
     print(f"  F1 Score   : {f1:.4f}")
     print(f"  ROC-AUC    : {roc_auc:.4f}")
     print(f"  {'─' * 40}")
-    print(f"\n{classification_report(y_test, y_pred, target_names=['Normal','Pre-failure'])}")
+    print(f"\n{classification_report(y_test, y_pred, target_names=['Normal','Failure'])}")
 
-    # Save threshold
     with open("output/lstm_best_threshold.json", "w") as f:
         json.dump({"threshold": round(float(best_t), 2)}, f)
 
@@ -145,9 +131,6 @@ def evaluate(model, X_test, y_test):
     }
 
 
-# ──────────────────────────────────────────────────────────
-#  Plots
-# ──────────────────────────────────────────────────────────
 def plot_training_history(history):
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
     axes[0].plot(history.history["loss"],     label="Train")
@@ -172,9 +155,9 @@ def plot_confusion_matrix(model, X_test, y_test, threshold):
     cm = confusion_matrix(y_test, y_pred)
     plt.figure(figsize=(6, 5))
     sns.heatmap(cm, annot=True, fmt="d", cmap="Oranges",
-                xticklabels=["Normal", "Pre-failure"],
-                yticklabels=["Normal", "Pre-failure"])
-    plt.title("LSTM — Confusion Matrix")
+                xticklabels=["Normal", "Failure"],
+                yticklabels=["Normal", "Failure"])
+    plt.title("LSTM — Confusion Matrix (chronological holdout)")
     plt.ylabel("Actual"); plt.xlabel("Predicted")
     plt.tight_layout()
     path = os.path.join(config.PLOTS_PATH, "lstm_confusion_matrix.png")
@@ -191,7 +174,7 @@ def plot_roc_curve(model, X_test, y_test):
     plt.plot([0, 1], [0, 1], "k--", lw=1)
     plt.xlim([0, 1]); plt.ylim([0, 1.02])
     plt.xlabel("False Positive Rate"); plt.ylabel("True Positive Rate")
-    plt.title("LSTM — ROC Curve"); plt.legend(loc="lower right")
+    plt.title("LSTM — ROC Curve (chronological holdout)"); plt.legend(loc="lower right")
     plt.tight_layout()
     path = os.path.join(config.PLOTS_PATH, "lstm_roc_curve.png")
     plt.savefig(path, dpi=150); plt.close()
@@ -215,7 +198,7 @@ def plot_model_comparison():
     b1 = ax.bar(x - width/2, xgb_vals,  width, label="XGBoost", color="steelblue")
     b2 = ax.bar(x + width/2, lstm_vals, width, label="LSTM",     color="darkorange")
     ax.set_ylabel("Score")
-    ax.set_title("Model Comparison — XGBoost vs LSTM")
+    ax.set_title("Model Comparison — XGBoost vs LSTM (chronological holdout)")
     ax.set_xticks(x)
     ax.set_xticklabels(["Precision", "Recall", "F1", "ROC-AUC"])
     ax.set_ylim([0, 1.1]); ax.legend()
@@ -230,72 +213,49 @@ def plot_model_comparison():
     print(f"  ✓ Model comparison → {path}")
 
 
-# ──────────────────────────────────────────────────────────
-#  Main
-# ──────────────────────────────────────────────────────────
 def main():
     os.makedirs(config.PLOTS_PATH, exist_ok=True)
     print("═" * 60)
-    print("  Stage 3: LSTM Model Training  (v2 — Bidirectional)")
+    print("  Stage 3: LSTM Model Training  (v3 — chronological split)")
     print("  MSc Research — Failure Prediction ML Pipeline")
     print("═" * 60)
 
-    # ── Load ───────────────────────────────────────────────
     X_raw, y, feature_cols = load_data()
 
-    # ── Scale ──────────────────────────────────────────────
     scaler = joblib.load(config.SCALER_PATH) if os.path.exists(config.SCALER_PATH) \
              else StandardScaler()
     X_scaled = scaler.fit_transform(X_raw)
 
-    # ── Sequences ──────────────────────────────────────────
     print(f"\nBuilding sequences (length={SEQUENCE_LENGTH} × {config.WINDOW_SIZE_SECONDS}s)...")
     X_seq, y_seq = build_sequences(X_scaled, y, SEQUENCE_LENGTH)
     n_features   = X_seq.shape[2]
 
-    # ── Stratified split (random, not time-ordered) ────────
-    # Stratified ensures both splits have same failure ratio
-    X_train, X_test, y_train, y_test = train_test_split(
-        X_seq, y_seq,
-        test_size    = 0.2,
-        random_state = 42,
-        stratify     = y_seq,   # keeps class ratio balanced
-    )
-    print(f"\n  Train : {len(X_train):,}  |  Test : {len(X_test):,}")
+    # ── Chronological split — train on earlier sequences, test on later ──
+    split_idx = int(len(X_seq) * 0.8)
+    X_train, X_test = X_seq[:split_idx], X_seq[split_idx:]
+    y_train, y_test = y_seq[:split_idx], y_seq[split_idx:]
+
+    print(f"\n  Train : {len(X_train):,} (earlier timeline)  |  Test : {len(X_test):,} (later, unseen)")
     print(f"  Train failures: {y_train.sum()}  |  Test failures: {y_test.sum()}")
 
-    # ── Class weights ───────────────────────────────────────
     weights = compute_class_weight("balanced", classes=np.array([0, 1]), y=y_train)
     class_weights = {0: weights[0], 1: weights[1]}
-    print(f"\n  Class weights: normal={weights[0]:.3f}  pre-failure={weights[1]:.3f}")
+    print(f"\n  Class weights: normal={weights[0]:.3f}  failure={weights[1]:.3f}")
 
-    # ── Build model ─────────────────────────────────────────
     print("\nBuilding Bidirectional LSTM model...")
     model = build_model(SEQUENCE_LENGTH, n_features)
     model.summary()
 
-    # ── Train ───────────────────────────────────────────────
     callbacks = [
-        EarlyStopping(
-            monitor              = "val_auc",
-            patience             = 15,
-            restore_best_weights = True,
-            mode                 = "max",
-            verbose              = 1,
-        ),
-        ReduceLROnPlateau(
-            monitor  = "val_loss",
-            factor   = 0.5,
-            patience = 7,
-            verbose  = 1,
-        ),
+        EarlyStopping(monitor="val_auc", patience=15, restore_best_weights=True, mode="max", verbose=1),
+        ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=7, verbose=1),
     ]
 
     print("\nTraining Bidirectional LSTM...\n")
     history = model.fit(
         X_train, y_train,
         epochs           = 150,
-        batch_size       = 16,        # smaller batch = better gradient for rare class
+        batch_size       = 16,
         validation_split = 0.2,
         class_weight     = class_weights,
         callbacks        = callbacks,
@@ -303,20 +263,16 @@ def main():
     )
     print(f"\n  ✓ Training complete — {len(history.history['loss'])} epochs")
 
-    # ── Evaluate ────────────────────────────────────────────
     results = evaluate(model, X_test, y_test)
 
-    # ── Plots ───────────────────────────────────────────────
     print("\nGenerating plots...")
     plot_training_history(history)
     plot_confusion_matrix(model, X_test, y_test, results["threshold"])
     plot_roc_curve(model, X_test, y_test)
 
-    # ── Save model ──────────────────────────────────────────
     model.save(config.LSTM_MODEL_PATH)
     print(f"\n  ✓ LSTM model saved → {config.LSTM_MODEL_PATH}")
 
-    # ── Save results ────────────────────────────────────────
     existing = {}
     if os.path.exists(config.RESULTS_PATH):
         with open(config.RESULTS_PATH) as f:
@@ -327,7 +283,6 @@ def main():
 
     plot_model_comparison()
 
-    # ── Summary ─────────────────────────────────────────────
     print("\n" + "═" * 60)
     print("  TRAINING COMPLETE")
     print("═" * 60)
@@ -336,11 +291,8 @@ def main():
         print(f"\n  {'Metric':<15} {'XGBoost':>10} {'LSTM':>10}")
         print(f"  {'─' * 37}")
         for m in ["precision", "recall", "f1", "roc_auc"]:
-            xv = xgb.get(m, 0)
-            lv = results.get(m, 0)
-            better = "← LSTM" if lv > xv else "← XGB"
-            print(f"  {m:<15} {xv:>10} {lv:>10}  {better}")
-    print(f"\n  Next step: python stage4_prediction_api.py")
+            print(f"  {m:<15} {xgb.get(m, 0):>10} {results.get(m, 0):>10}")
+    print(f"\n  Next step: python stage2b_ensemble.py")
     print("═" * 60)
 
 
