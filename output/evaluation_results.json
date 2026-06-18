@@ -1,27 +1,27 @@
 {
   "xgboost": {
-    "precision": 0.4015,
-    "recall": 0.7067,
-    "f1": 0.5121,
-    "roc_auc": 0.8592,
-    "cv_f1_mean": 0.5972,
-    "cv_roc_mean": 0.8922
+    "precision": 0.9221,
+    "recall": 0.8503,
+    "f1": 0.8847,
+    "roc_auc": 0.9755,
+    "cv_f1_mean": 0.7975,
+    "cv_roc_mean": 0.966
   },
   "lstm": {
-    "precision": 0.3697,
-    "recall": 0.8133,
-    "f1": 0.5083,
-    "roc_auc": 0.8436,
-    "threshold": 0.55
+    "precision": 0.7683,
+    "recall": 0.759,
+    "f1": 0.7636,
+    "roc_auc": 0.7931,
+    "threshold": 0.6
   },
   "ensemble": {
-    "label": "Ensemble (XGB=0.5 LSTM=0.5)",
-    "threshold": 0.65,
-    "precision": 0.7258,
-    "recall": 0.6,
-    "f1": 0.6569,
-    "roc_auc": 0.9094,
-    "xgb_weight": 0.5,
-    "lstm_weight": 0.5
+    "label": "Ensemble (XGB=1.0 LSTM=0.0)",
+    "threshold": 0.6,
+    "precision": 0.9718,
+    "recall": 0.8313,
+    "f1": 0.8961,
+    "roc_auc": 0.9773,
+    "xgb_weight": 1.0,
+    "lstm_weight": 0.0
   }
 }
