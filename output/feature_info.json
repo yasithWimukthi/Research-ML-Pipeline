@@ -1,7 +1,7 @@
 {
-  "total_windows": 2405,
-  "normal_windows": 2032,
-  "pre_failure_windows": 373,
+  "total_windows": 2538,
+  "normal_windows": 1623,
+  "failure_windows": 915,
   "feature_count": 214,
   "features": [
     "order-service__error_count",
@@ -221,5 +221,16 @@
   ],
   "window_size_seconds": 30,
   "prediction_horizon_s": 300,
-  "failure_events_found": 247
+  "gradual_types": [
+    "MEMORY_LEAK"
+  ],
+  "sudden_types": [
+    "HIGH_LATENCY",
+    "CPU_OVERLOAD",
+    "SLOW_QUERY",
+    "DB_POOL_EXHAUSTION",
+    "GATEWAY_TIMEOUT"
+  ],
+  "predictive_anchors": 63,
+  "active_periods": 185
 }
